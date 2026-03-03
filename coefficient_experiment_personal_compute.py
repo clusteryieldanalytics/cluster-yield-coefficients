@@ -284,7 +284,7 @@ def setup_large_parquet():
         uuid() AS key,
         {extra_cols},
         dt AS date
-    FROM RANGE(0, {ROW_COUNT}) AS t(id)
+    FROM RANGE(0, {ROW_COUNT // NUM_DATES}) AS t(id)
     CROSS JOIN (
         SELECT explode(sequence(
             DATE '2025-01-01',
@@ -339,22 +339,50 @@ def setup_small_delta():
 
 
 def setup_large_csv():
-    """Create a CSV copy of the large table for row-based scan experiments."""
-    spark.sql(f"DROP TABLE IF EXISTS {LARGE_CSV}")
+    """Create a CSV copy of the large table for row-based scan experiments.
 
-    # CSV on personal compute — use a subset to avoid extreme disk usage
-    # CSV is ~5-10× larger than Delta for the same data
-    sql = f"""
-    CREATE TABLE {LARGE_CSV}
-    USING CSV
-    AS SELECT id, key, val1, val2, val3, val4, val5, date
-    FROM {LARGE_PARQUET}
+    Unity Catalog only allows Delta for managed tables, so we write CSV
+    to a DBFS path and register it as an external table (or temp view as fallback).
     """
-    print(f"Creating {LARGE_CSV} (CSV, subset of columns to manage disk) ...")
+    csv_path = "dbfs:/tmp/cluster_yield_experiment/large_csv"
+
+    # Clean up previous data
+    try:
+        dbutils.fs.rm(csv_path, recurse=True)
+    except Exception:
+        pass
+
+    print(f"Writing CSV to {csv_path} (subset of columns to manage disk) ...")
     t0 = time.time()
-    spark.sql(sql)
+
+    (spark.table(LARGE_PARQUET)
+        .select("id", "key", "val1", "val2", "val3", "val4", "val5", "date")
+        .write.mode("overwrite")
+        .option("header", "true")
+        .csv(csv_path))
+
     elapsed = time.time() - t0
-    print(f"  Created ({elapsed:.0f}s)")
+    print(f"  Written ({elapsed:.0f}s)")
+
+    # Register so queries can reference it by name.
+    # Try external table first; fall back to temp view if UC blocks it.
+    global LARGE_CSV
+    try:
+        spark.sql(f"DROP TABLE IF EXISTS {LARGE_CSV}")
+        spark.sql(f"""
+            CREATE TABLE {LARGE_CSV}
+            USING CSV
+            OPTIONS (header 'true', inferSchema 'true')
+            LOCATION '{csv_path}'
+        """)
+        print(f"  Registered as external table: {LARGE_CSV}")
+    except Exception as e:
+        print(f"  External table failed ({e})")
+        print(f"  Falling back to temp view...")
+        spark.read.option("header", "true").option("inferSchema", "true") \
+            .csv(csv_path).createOrReplaceTempView("large_csv_view")
+        LARGE_CSV = "large_csv_view"
+        print(f"  Registered as temp view: {LARGE_CSV}")
 
 
 def run_full_setup():
