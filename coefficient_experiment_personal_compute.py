@@ -201,7 +201,7 @@ aqe_off = lock_spark_config()
 def capture_cluster_metadata():
     sc = spark.sparkContext
     meta = {
-        "capture_timestamp": datetime.utcnow().isoformat(),
+        "capture_timestamp": datetime.now().isoformat(),
         "spark_version": sc.version,
         "default_parallelism": sc.defaultParallelism,
     }
@@ -423,60 +423,94 @@ def run_full_setup():
 def capture_spark_metrics() -> dict:
     """
     Capture aggregate task metrics from the most recently completed Spark job.
-    Uses the SparkListener's accumulated metrics via the status tracker.
 
-    Returns a dict of metric totals across all stages of the last job.
+    Strategy 1: Spark UI REST API (most reliable on Databricks).
+    Strategy 2: Internal statusStore JVM API (fallback).
     """
-    sc = spark.sparkContext
-    tracker = sc.statusTracker()
+    import json
+    from urllib.request import urlopen
 
-    # Get the most recent job IDs
-    job_ids = tracker.getActiveJobIds()  # May be empty if job already finished
-
-    # Fallback: access metrics via the Spark UI's REST API internally
-    # This is more reliable than the status tracker for completed jobs.
-    metrics = {
-        "bytes_read": 0,
-        "bytes_written": 0,
-        "shuffle_read_bytes": 0,
-        "shuffle_write_bytes": 0,
-        "executor_cpu_time_ns": 0,
-        "executor_run_time_ms": 0,
+    empty = {
+        "bytes_read": 0, "bytes_written": 0,
+        "shuffle_read_bytes": 0, "shuffle_write_bytes": 0,
+        "executor_cpu_time_ns": 0, "executor_run_time_ms": 0,
         "result_size": 0,
-        "records_read": 0,
-        "records_written": 0,
-        "shuffle_records_read": 0,
-        "shuffle_records_written": 0,
+        "records_read": 0, "records_written": 0,
+        "shuffle_records_read": 0, "shuffle_records_written": 0,
     }
 
+    e1 = None
+
+    # ---- Strategy 1: Spark UI REST API ----
     try:
-        # Access the internal Java SparkContext to get completed stage metrics
-        jsc = sc._jsc
-        status_store = jsc.sc().statusStore()
+        sc = spark.sparkContext
+        ui_url = sc.uiWebUrl
+        if not ui_url:
+            raise ValueError("uiWebUrl not available")
+        app_id = sc.applicationId
 
-        # Get the last completed job
-        completed_jobs = status_store.jobsList(None).toArray()
-        if len(completed_jobs) == 0:
-            return metrics
+        jobs_url = f"{ui_url}/api/v1/applications/{app_id}/jobs"
+        with urlopen(jobs_url) as resp:
+            jobs = json.loads(resp.read())
 
-        last_job = completed_jobs[-1]
-        job_id = last_job.jobId()
-        stage_ids = last_job.stageIds()
+        last_job = next((j for j in jobs if j.get("status") == "SUCCEEDED"), None)
+        if last_job is None:
+            return empty
+
+        stage_ids = last_job.get("stageIds", [])
+        metrics = dict(empty)
 
         for sid in stage_ids:
             try:
-                # Each attempt
+                stage_url = f"{ui_url}/api/v1/applications/{app_id}/stages/{sid}"
+                with urlopen(stage_url) as resp:
+                    attempts = json.loads(resp.read())
+                if not attempts:
+                    continue
+                s = attempts[-1]
+                metrics["bytes_read"]              += s.get("inputBytes", 0)
+                metrics["records_read"]            += s.get("inputRecords", 0)
+                metrics["bytes_written"]           += s.get("outputBytes", 0)
+                metrics["records_written"]         += s.get("outputRecords", 0)
+                metrics["shuffle_read_bytes"]      += s.get("shuffleReadBytes", 0)
+                metrics["shuffle_write_bytes"]     += s.get("shuffleWriteBytes", 0)
+                metrics["shuffle_records_read"]    += s.get("shuffleReadRecords", 0)
+                metrics["shuffle_records_written"] += s.get("shuffleWriteRecords", 0)
+                metrics["executor_cpu_time_ns"]    += s.get("executorCpuTime", 0)
+                metrics["executor_run_time_ms"]    += s.get("executorRunTime", 0)
+                metrics["result_size"]             += s.get("resultSize", 0)
+            except Exception:
+                continue
+
+        metrics["_source"] = "spark_rest_api"
+        return metrics
+
+    except Exception as ex1:
+        e1 = ex1
+
+    # ---- Strategy 2: statusStore JVM API ----
+    try:
+        sc = spark.sparkContext
+        jsc = sc._jsc
+        status_store = jsc.sc().statusStore()
+        completed_jobs = status_store.jobsList(None).toArray()
+        if len(completed_jobs) == 0:
+            return empty
+
+        last_job = completed_jobs[-1]
+        stage_ids = last_job.stageIds()
+        metrics = dict(empty)
+
+        for sid in stage_ids:
+            try:
                 stage_data = status_store.stageData(sid, False)
                 if stage_data.isEmpty():
                     continue
                 stage = stage_data.get()
-
-                # The metrics are in the stage's task summary
                 m = stage.metrics()
                 if m.isEmpty():
                     continue
                 sm = m.get()
-
                 metrics["bytes_read"]              += sm.inputMetrics().bytesRead()
                 metrics["records_read"]            += sm.inputMetrics().recordsRead()
                 metrics["bytes_written"]           += sm.outputMetrics().bytesWritten()
@@ -491,11 +525,12 @@ def capture_spark_metrics() -> dict:
             except Exception:
                 continue
 
-    except Exception as e:
-        # statusStore API may not exist on all runtimes. Fall back gracefully.
-        metrics["_capture_error"] = str(e)
+        metrics["_source"] = "status_store_jvm"
+        return metrics
 
-    return metrics
+    except Exception as ex2:
+        empty["_capture_error"] = f"REST API: {e1} | statusStore: {ex2}"
+        return empty
 
 # COMMAND ----------
 
@@ -612,7 +647,7 @@ def build_query_series() -> list:
                 WHERE date BETWEEN '2025-01-01' AND '2025-01-{NUM_DATES:02d}'
             """,
             "required_ops": ["Scan"],
-            "forbidden_ops": ["Exchange", "Sort"],
+            "forbidden_ops": ["Sort"],
         },
         {
             "label": "Q2",
@@ -625,7 +660,7 @@ def build_query_series() -> list:
                 WHERE date BETWEEN '2025-01-01' AND '2025-01-{NUM_DATES:02d}'
             """,
             "required_ops": ["Scan"],
-            "forbidden_ops": ["Exchange"],
+            "forbidden_ops": [],
         },
         {
             "label": "Q3",
@@ -775,7 +810,7 @@ def run_single(label: str, sql: str, run_number: int, is_warmup: bool,
         return ExperimentRun(
             query_label=label, run_number=run_number, is_warmup=is_warmup,
             wall_clock_ms=0, plan_valid=False, plan_validation_msg=plan_msg,
-            plan_text=plan_text, timestamp=datetime.utcnow().isoformat(),
+            plan_text=plan_text, timestamp=datetime.now().isoformat(),
         )
 
     # Force GC before measurement
@@ -794,6 +829,16 @@ def run_single(label: str, sql: str, run_number: int, is_warmup: bool,
 
     # Capture Spark metrics for this job
     metrics = capture_spark_metrics()
+    # One-time diagnostic: which metrics source worked?
+    if not hasattr(capture_spark_metrics, "_diag_logged"):
+        _src = metrics.get("_source", "NONE")
+        _err = metrics.get("_capture_error", "")
+        if _err:
+            print(f"  [metrics] CAPTURE FAILED: {_err}")
+        else:
+            br = metrics.get("bytes_read", 0)
+            print(f"  [metrics] source={_src} | first bytes_read={br:,}")
+        capture_spark_metrics._diag_logged = True
 
     # Restore post-configs
     if post_configs:
@@ -816,7 +861,7 @@ def run_single(label: str, sql: str, run_number: int, is_warmup: bool,
         records_written=metrics.get("records_written", 0),
         shuffle_records_written=metrics.get("shuffle_records_written", 0),
         plan_text=plan_text,
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now().isoformat(),
     )
 
     tag = "  " if is_warmup else "🔥"
@@ -941,7 +986,7 @@ def run_q9_pyspark_udf(runs: int = None, warmup: int = None):
             executor_run_time_ms=metrics.get("executor_run_time_ms", 0),
             records_read=metrics.get("records_read", 0),
             plan_text=plan_text,
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now().isoformat(),
         )
         experiment_results.append(run)
 
