@@ -61,7 +61,7 @@ FQ = lambda table: f"{CATALOG}.{SCHEMA}.{table}"
 
 LARGE_PARQUET = FQ("large_parquet")
 SMALL_DELTA   = FQ("small_delta")
-LARGE_CSV     = FQ("large_csv")
+LARGE_CSV     = "large_csv_view"  # temp view; UC blocks managed CSV tables
 SORTED_OUTPUT = FQ("sorted_output")
 
 # ---------------------------------------------------------------------------
@@ -341,8 +341,9 @@ def setup_small_delta():
 def setup_large_csv():
     """Create a CSV copy of the large table for row-based scan experiments.
 
-    Unity Catalog only allows Delta for managed tables, so we write CSV
-    to a DBFS path and register it as an external table (or temp view as fallback).
+    Unity Catalog only allows managed Delta tables, so we write CSV to
+    a temporary path and register it as a session-scoped temp view.
+    The view name matches LARGE_CSV set in the config cell.
     """
     csv_path = "dbfs:/tmp/cluster_yield_experiment/large_csv"
 
@@ -364,25 +365,10 @@ def setup_large_csv():
     elapsed = time.time() - t0
     print(f"  Written ({elapsed:.0f}s)")
 
-    # Register so queries can reference it by name.
-    # Try external table first; fall back to temp view if UC blocks it.
-    global LARGE_CSV
-    try:
-        spark.sql(f"DROP TABLE IF EXISTS {LARGE_CSV}")
-        spark.sql(f"""
-            CREATE TABLE {LARGE_CSV}
-            USING CSV
-            OPTIONS (header 'true', inferSchema 'true')
-            LOCATION '{csv_path}'
-        """)
-        print(f"  Registered as external table: {LARGE_CSV}")
-    except Exception as e:
-        print(f"  External table failed ({e})")
-        print(f"  Falling back to temp view...")
-        spark.read.option("header", "true").option("inferSchema", "true") \
-            .csv(csv_path).createOrReplaceTempView("large_csv_view")
-        LARGE_CSV = "large_csv_view"
-        print(f"  Registered as temp view: {LARGE_CSV}")
+    # Register as temp view (matches LARGE_CSV = "large_csv_view" in config)
+    spark.read.option("header", "true").option("inferSchema", "true") \
+        .csv(csv_path).createOrReplaceTempView(LARGE_CSV)
+    print(f"  Registered as temp view: {LARGE_CSV}")
 
 
 def run_full_setup():
