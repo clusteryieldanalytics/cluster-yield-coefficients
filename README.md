@@ -4,8 +4,8 @@
 
 | File | Purpose |
 |------|---------|
-| `coefficient_experiment_harness.py` | Full Python notebook for Databricks. Automated execution with plan validation, billing collection, and ratio analysis. Import as a Databricks notebook. |
-| `coefficient_experiment_manual.sql` | Standalone SQL queries for manual execution in a SQL editor. Copy-paste each query, run 5×, then use the billing queries to collect results. |
+| `experiment.py` | Full Python notebook for Databricks. Automated execution with plan validation, billing collection, and ratio analysis. Import as a Databricks notebook. |
+| `experiment_sql.sql` | Standalone SQL queries for manual execution in a SQL editor. Copy-paste each query, run 5×, then use the billing queries to collect results. |
 
 ## Two Workflows
 
