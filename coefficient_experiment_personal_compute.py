@@ -562,7 +562,7 @@ OPERATOR_ALIASES = {
     "HashAggregate":      ["HashAggregate", "PhotonGroupingAgg", "PhotonHashAggregate"],
     "Sort":               ["Sort", "PhotonSort"],
     "Exchange":           ["Exchange", "PhotonShuffleExchangeSink", "ShuffleExchange"],
-    "SortMergeJoin":      ["SortMergeJoin", "PhotonSortMergeJoin"],
+    "SortMergeJoin":      ["SortMergeJoin", "PhotonSortMergeJoin", "ShuffledHashJoin", "PhotonShuffledHashJoin"],
     "BroadcastHashJoin":  ["BroadcastHashJoin", "PhotonBroadcastHashJoin"],
     "BroadcastExchange":  ["BroadcastExchange", "PhotonBroadcastExchange"],
     "CartesianProduct":   ["CartesianProduct", "PhotonCartesianProduct", "BroadcastNestedLoopJoin", "PhotonBroadcastNestedLoopJoin"],
@@ -986,10 +986,10 @@ def run_q9_pyspark_udf(runs: int = None, warmup: int = None):
         metrics = capture_spark_metrics()
 
         # Validate plan — should contain Python / BatchEvalPython / ArrowEvalPython
-        f_buf = io.StringIO()
-        with redirect_stdout(f_buf):
-            df.explain(mode="formatted")
-        plan_text = f_buf.getvalue()
+        try:
+            plan_text = df._jdf.queryExecution().executedPlan().toString()
+        except Exception:
+            plan_text = str(df.explain(mode="formatted")) or ""
         plan_valid, plan_msg = validate_plan(plan_text, ["Python"], [])
 
         run = ExperimentRun(
