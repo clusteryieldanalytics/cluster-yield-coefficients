@@ -555,21 +555,40 @@ def get_explain_plan(sql: str) -> str:
         return f"EXPLAIN failed: {e}"
 
 
+# Photon uses different operator names than standard Spark.
+# This map lets the validator accept either form.
+OPERATOR_ALIASES = {
+    "Scan":               ["Scan", "PhotonScan", "FileScan", "BatchScan"],
+    "HashAggregate":      ["HashAggregate", "PhotonGroupingAgg", "PhotonHashAggregate"],
+    "Sort":               ["Sort", "PhotonSort"],
+    "Exchange":           ["Exchange", "PhotonShuffleExchangeSink", "ShuffleExchange"],
+    "SortMergeJoin":      ["SortMergeJoin", "PhotonSortMergeJoin"],
+    "BroadcastHashJoin":  ["BroadcastHashJoin", "PhotonBroadcastHashJoin"],
+    "BroadcastExchange":  ["BroadcastExchange", "PhotonBroadcastExchange"],
+    "CartesianProduct":   ["CartesianProduct", "PhotonCartesianProduct", "BroadcastNestedLoopJoin", "PhotonBroadcastNestedLoopJoin"],
+    "UDF":                ["BatchEvalPython", "ArrowEvalPython", "PythonUDF"],
+}
+
+def _op_present(op_name: str, plan_upper: str) -> bool:
+    """Check if an operator (or any of its Photon aliases) appears in the plan."""
+    aliases = OPERATOR_ALIASES.get(op_name, [op_name])
+    return any(a.upper() in plan_upper for a in aliases)
+
 def validate_plan(plan_text: str, required_ops: list, forbidden_ops: list = None) -> tuple:
     """
     Check that the physical plan contains all required operators
-    and none of the forbidden ones.
+    and none of the forbidden ones. Handles Photon operator name variants.
     Returns (is_valid, reason).
     """
     plan_upper = plan_text.upper()
     forbidden_ops = forbidden_ops or []
 
     for op in required_ops:
-        if op.upper() not in plan_upper:
+        if not _op_present(op, plan_upper):
             return False, f"Missing required operator: {op}"
 
     for op in forbidden_ops:
-        if op.upper() in plan_upper:
+        if _op_present(op, plan_upper):
             return False, f"Found forbidden operator: {op} (AQE rewrite?)"
 
     return True, "OK"
