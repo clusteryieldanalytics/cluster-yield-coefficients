@@ -64,17 +64,50 @@ SMALL_DELTA   = FQ("small_delta")
 LARGE_CSV     = FQ("large_csv")
 SORTED_OUTPUT = FQ("sorted_output")
 
-# Current coefficients from CostCoefficients.scala (for comparison)
-CURRENT_COEFFICIENTS = {
+# ---------------------------------------------------------------------------
+# Current coefficients from CostCoefficients.scala
+# Each operator has TWO weights: Coefficient(standard, photon).
+# The harness auto-selects the correct column based on cluster metadata.
+# ---------------------------------------------------------------------------
+COEFFICIENTS_STANDARD = {
     "ScanColumnar":       {"weight": 0.02, "ratio": 1.0},
     "ScanRowBased":       {"weight": 0.06, "ratio": 3.0},
     "Shuffle":            {"weight": 0.15, "ratio": 7.5},
     "Sort":               {"weight": 0.08, "ratio": 4.0},
     "BroadcastHashJoin":  {"weight": 0.02, "ratio": 1.0},
     "SortMergeJoin":      {"weight": 0.15, "ratio": 7.5},
+    "ShuffledHashJoin":   {"weight": 0.10, "ratio": 5.0},
     "CartesianProduct":   {"weight": 1.00, "ratio": 50.0},
     "PySparkUDF":         {"weight": 0.10, "ratio": 5.0},
 }
+
+COEFFICIENTS_PHOTON = {
+    "ScanColumnar":       {"weight": 0.01, "ratio": 1.0},
+    "ScanRowBased":       {"weight": 0.04, "ratio": 4.0},
+    "Shuffle":            {"weight": 0.08, "ratio": 8.0},
+    "Sort":               {"weight": 0.04, "ratio": 4.0},
+    "BroadcastHashJoin":  {"weight": 0.01, "ratio": 1.0},
+    "SortMergeJoin":      {"weight": 0.08, "ratio": 8.0},
+    "ShuffledHashJoin":   {"weight": 0.06, "ratio": 6.0},
+    "CartesianProduct":   {"weight": 0.60, "ratio": 60.0},
+    "PySparkUDF":         {"weight": 0.10, "ratio": 10.0},
+}
+
+# Auto-selected after cluster metadata capture (S1b). Default: standard.
+CURRENT_COEFFICIENTS = COEFFICIENTS_STANDARD
+
+def select_coefficients(metadata):
+    global CURRENT_COEFFICIENTS
+    photon = str(metadata.get("photon_enabled", "false")).lower()
+    if photon in ("true", "1", "yes"):
+        CURRENT_COEFFICIENTS = COEFFICIENTS_PHOTON
+        label = "PHOTON"
+    else:
+        CURRENT_COEFFICIENTS = COEFFICIENTS_STANDARD
+        label = "STANDARD (non-Photon)"
+    print(f"\nCoefficient set: {label}")
+    print(f"  (comparing empirical ratios against {label} weights from CostCoefficients.scala)")
+    return CURRENT_COEFFICIENTS
 
 print(f"Config: {CATALOG}.{SCHEMA}")
 print(f"  ROW_COUNT      = {ROW_COUNT:,}")
@@ -218,6 +251,7 @@ def capture_cluster_metadata():
 
 
 cluster_metadata = capture_cluster_metadata()
+select_coefficients(cluster_metadata)
 
 # COMMAND ----------
 
@@ -1078,7 +1112,8 @@ def analyze_results(results: list = None):
 
     # ── Print comparison table ──
     print(f"\n{'='*90}")
-    print(f"  OPERATOR COST RATIOS — Empirical (wall-clock) vs Current Coefficients")
+    coeff_label = "PHOTON" if CURRENT_COEFFICIENTS is COEFFICIENTS_PHOTON else "STANDARD"
+    print(f"  OPERATOR COST RATIOS -- Empirical (wall-clock) vs {coeff_label} Coefficients")
     print(f"{'='*90}")
     print(f"  {'Operator':<22} {'Empirical':>10} {'Current':>10} {'Emp/Cur':>10} {'Status':>12}")
     print(f"  {'-'*22} {'-'*10} {'-'*10} {'-'*10} {'-'*12}")
@@ -1140,6 +1175,8 @@ def export_results_json(path: str = "/tmp/coefficient_experiment_results.json"):
             "row_count": ROW_COUNT,
             "measurement_basis": "wall_clock_ms",
             "current_coefficients": CURRENT_COEFFICIENTS,
+            "all_coefficients": {"standard": COEFFICIENTS_STANDARD, "photon": COEFFICIENTS_PHOTON},
+            "selected_coefficient_set": "photon" if CURRENT_COEFFICIENTS is COEFFICIENTS_PHOTON else "standard",
         },
         "cluster_metadata": cluster_metadata,
         "runs": [r.to_dict() for r in experiment_results],
