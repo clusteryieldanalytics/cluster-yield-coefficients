@@ -2,23 +2,24 @@
 # MAGIC %md
 # MAGIC # Operator Cost Coefficient — Empirical Experiment Harness (Personal Compute)
 # MAGIC
-# MAGIC **Purpose:** Run a controlled query series on a Databricks Personal Compute cluster, 
-# MAGIC measure wall-clock time and Spark task metrics, and derive empirical operator cost ratios.
+# MAGIC **Purpose:** Run the controlled query series from the coefficient-transparency-session-brief
+# MAGIC on a Databricks Personal Compute cluster, measure wall-clock time and Spark task metrics,
+# MAGIC and derive empirical operator cost ratios.
 # MAGIC
-# MAGIC **Why personal compute?** Serverless bills per-DBU per-query, which is ideal. But
-# MAGIC serverless may not be available (needs Unity Catalog + account-level enablement) and
-# MAGIC locks out most Spark configs. Personal compute gives full config control and a fixed
-# MAGIC resource envelope where wall-clock time is a valid proxy for resource cost — on a
-# MAGIC single node with fixed CPU/RAM/disk, execution time is proportional to resource
-# MAGIC consumption.
+# MAGIC **Why classic compute (not serverless)?** Serverless bills per-DBU per-query, which
+# MAGIC is ideal, but it locks out most Spark configs (including disabling AQE and setting
+# MAGIC broadcast thresholds). Classic compute gives full config control and a fixed resource
+# MAGIC envelope where wall-clock time is proportional to resource consumption.
+# MAGIC
+# MAGIC **Cluster-agnostic:** This harness runs on any cluster size -- single-node personal
+# MAGIC compute, multi-node standard clusters, etc. Run it on multiple cluster shapes to see
+# MAGIC how ratios shift with node count, network topology, and memory per executor. The
+# MAGIC harness captures full cluster metadata so results from different runs are comparable.
 # MAGIC
 # MAGIC **Measurement basis:** Wall-clock time + Spark task-level metrics (executor CPU time,
-# MAGIC bytes read, shuffle bytes, etc.) captured via the Spark listener / status tracker.
-# MAGIC Ratios derived from wall-clock time on a fixed cluster should approximate DBU-based
-# MAGIC ratios because time ≈ resources on a fixed-size machine.
+# MAGIC bytes read, shuffle bytes, etc.) captured via the Spark status tracker.
 # MAGIC
-# MAGIC **Table sizes:** ~10 GB (not 100 GB). A single-node personal compute cluster can't
-# MAGIC handle 100 GB efficiently. 10 GB is large enough to exceed per-query overhead and
+# MAGIC **Table sizes:** Default ~10 GB. Increase ROW_COUNT for larger clusters.
 # MAGIC produce meaningful ratios while completing in reasonable time.
 # MAGIC
 # MAGIC **Usage:**
@@ -153,6 +154,70 @@ def lock_spark_config():
 
 # Run immediately:
 aqe_off = lock_spark_config()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## S1b - Cluster Metadata Capture
+# MAGIC
+# MAGIC Records what this harness is running on so results from different
+# MAGIC cluster shapes can be compared.
+
+# COMMAND ----------
+
+def capture_cluster_metadata():
+    sc = spark.sparkContext
+    meta = {
+        "capture_timestamp": datetime.utcnow().isoformat(),
+        "spark_version": sc.version,
+        "default_parallelism": sc.defaultParallelism,
+    }
+    try:
+        status = sc._jsc.sc().getExecutorMemoryStatus()
+        meta["total_executors"] = status.size()
+        meta["worker_executors"] = max(status.size() - 1, 1)
+        meta["executor_memory"] = spark.conf.get("spark.executor.memory", "unknown")
+        meta["executor_cores"] = spark.conf.get("spark.executor.cores", "unknown")
+        meta["driver_memory"] = spark.conf.get("spark.driver.memory", "unknown")
+    except Exception as e:
+        meta["executor_topology_error"] = str(e)
+    try:
+        meta["databricks_runtime"] = spark.conf.get("spark.databricks.clusterUsageTags.sparkVersion", "unknown")
+    except Exception:
+        meta["databricks_runtime"] = "unknown"
+    try:
+        meta["photon_enabled"] = spark.conf.get("spark.databricks.photon.enabled", "unknown")
+    except Exception:
+        meta["photon_enabled"] = "unknown"
+    for tag in ["clusterNodeType","driverNodeType","clusterWorkers","clusterName","clusterId"]:
+        try:
+            meta[tag] = spark.conf.get(f"spark.databricks.clusterUsageTags.{tag}", "unknown")
+        except Exception:
+            meta[tag] = "unknown"
+    try:
+        meta["external_shuffle_service"] = spark.conf.get("spark.shuffle.service.enabled", "false")
+    except Exception:
+        pass
+    workers = meta.get("worker_executors", 1)
+    is_multi = workers > 1
+    mode = "MULTI-NODE (real network shuffle)" if is_multi else "SINGLE-NODE (loopback shuffle)"
+    print(f"Cluster Metadata:")
+    print(f"  Spark:        {meta.get('spark_version')}")
+    print(f"  DBR:          {meta.get('databricks_runtime')}")
+    print(f"  Photon:       {meta.get('photon_enabled')}")
+    print(f"  Executors:    {workers} workers + driver")
+    print(f"  Exec memory:  {meta.get('executor_memory')}")
+    print(f"  Exec cores:   {meta.get('executor_cores')}")
+    print(f"  Parallelism:  {meta.get('default_parallelism')}")
+    print(f"  Node type:    {meta.get('clusterNodeType', 'unknown')}")
+    print(f"  Cluster:      {meta.get('clusterName', 'unknown')}")
+    print(f"  Mode:         {mode}")
+    if not is_multi:
+        print(f"  Note: shuffle/join ratios are a LOWER BOUND vs multi-node clusters")
+    return meta
+
+
+cluster_metadata = capture_cluster_metadata()
 
 # COMMAND ----------
 
@@ -1076,6 +1141,7 @@ def export_results_json(path: str = "/tmp/coefficient_experiment_results.json"):
             "measurement_basis": "wall_clock_ms",
             "current_coefficients": CURRENT_COEFFICIENTS,
         },
+        "cluster_metadata": cluster_metadata,
         "runs": [r.to_dict() for r in experiment_results],
     }
     with open(path, "w") as f:
@@ -1121,8 +1187,9 @@ def print_summary_table():
 # MAGIC ## §6 — Quick-Start Checklist
 # MAGIC
 # MAGIC ```
-# MAGIC [ ] 1. Create a Personal Compute cluster
-# MAGIC        - Single node, Standard_DS4_v2 or i3.xlarge (≥32 GB RAM)
+# MAGIC [ ] 1. Create a compute cluster (any size)
+# MAGIC        - Single node for baseline, multi-node to validate shuffle/join ratios
+# MAGIC        - Single node: Standard_DS4_v2 or i3.xlarge (≥32 GB RAM)
 # MAGIC        - DBR 14.3+ LTS recommended
 # MAGIC        - Photon ON or OFF (just note which — it affects ratios)
 # MAGIC
